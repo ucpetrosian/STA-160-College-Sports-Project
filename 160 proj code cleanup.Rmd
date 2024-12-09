@@ -1,0 +1,203 @@
+---
+title: "clean up sta 160 code"
+author: "Audrey Petrosian"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(klaR)
+library(ggplot2)
+library(readr)
+library(zoo)       
+library(vars)     
+library(forecast) 
+library(reshape2) 
+library(gridExtra) 
+options(scipen = 999)
+```
+```{r}
+data <- read_csv("C:/Users/mrcoo/Desktop/Fall 2024/STA 160/Data/sports_obs_all.csv")
+
+# Calculate proportion of academic spending allocated to football and aggregate by year
+data <- data %>%
+  mutate(proportion_football_academic = `Total Football Spending` / `Total Academic Spending (University-Wide)`) %>%
+  filter(!is.na(proportion_football_academic) & !is.na(Year)) 
+
+# Aggregate the data by year to get average values for each variable across institutions
+aggregated_data <- data %>%
+  group_by(Year) %>%
+  summarize(
+    avg_raw_football_spending = mean(`Total Football Spending`, na.rm = TRUE),
+    avg_proportion_football_academic = mean(proportion_football_academic, na.rm = TRUE),
+    avg_adm_rate = mean(ADM_RATE, na.rm = TRUE)
+  )
+
+# Convert columns to time series objects
+raw_spending_ts <- ts(aggregated_data$avg_raw_football_spending, start = min(aggregated_data$Year), frequency = 1)
+proportion_spending_ts <- ts(aggregated_data$avg_proportion_football_academic, start = min(aggregated_data$Year), frequency = 1)
+adm_rate_ts <- ts(aggregated_data$avg_adm_rate, start = min(aggregated_data$Year), frequency = 1)
+
+# Granger Causality Test
+var_data_raw <- cbind(adm_rate_ts, raw_spending_ts)
+var_model_raw <- VAR(var_data_raw, p = 2, type = "const")
+causality_raw <- causality(var_model_raw, cause = "raw_spending_ts")
+print(causality_raw)
+
+# Cross-Correlation Analysis for raw spending and admission rates
+ccf(raw_spending_ts, adm_rate_ts, main = "Cross-Correlation: Raw Football Spending vs Admission Rate")
+
+# Quadratic lag analysis and plot
+lagged_spending_raw <- stats::lag(raw_spending_ts, -2)  # 2-year lag
+lagged_model_raw_quad <- lm(adm_rate_ts ~ lagged_spending_raw + I(lagged_spending_raw^2))
+summary(lagged_model_raw_quad)
+
+# Plot the quadratic fit
+lag_data <- data.frame(AdmissionRate = adm_rate_ts, LaggedSpending = lagged_spending_raw)
+ggplot(lag_data, aes(x = LaggedSpending, y = AdmissionRate)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x + I(x^2), se = FALSE, color = "blue") +
+  labs(title = "Quadratic Fit: 2-Year Lagged Football Spending vs Admission Rate",
+       x = "Football Spending (2-Year Lag)", y = "Admission Rate") +
+  theme_minimal()
+
+# Impulse Response Function (IRF) Plot
+irf_result <- irf(var_model_raw, impulse = "raw_spending_ts", response = "adm_rate_ts", n.ahead = 10)
+plot(irf_result)
+
+# Simplified Cross-Correlation Heatmap
+ccf_values <- data.frame(Lag = ccf(raw_spending_ts, adm_rate_ts, plot = FALSE)$lag,
+                         Correlation = ccf(raw_spending_ts, adm_rate_ts, plot = FALSE)$acf)
+ggplot(ccf_values, aes(x = Lag, y = 1, fill = Correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  labs(title = "Heatmap of Cross-Correlation Across Lags",
+       x = "Lag", y = "", fill = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+# Forecasting admissions Using ARIMAX
+arimax_model <- auto.arima(adm_rate_ts, xreg = raw_spending_ts)
+summary(arimax_model)
+
+# Forecast future admissions
+future_raw_spending_model <- auto.arima(raw_spending_ts)
+future_raw_spending <- forecast(future_raw_spending_model, h = 5)$mean
+admission_forecast <- forecast(arimax_model, xreg = future_raw_spending, h = 5)
+
+autoplot(admission_forecast) +
+  labs(title = "Forecasted Admission Rates Using Football Spending",
+       x = "Year", y = "Admission Rate") +
+  theme_minimal()
+
+```
+
+
+
+```{r}
+## Call in dataset and add lag data and winning percentage
+df = read.csv("C:/Users/mrcoo/Desktop/Fall 2024/STA 160/Data/sports_obs_all.csv")
+df[c("Tot_Wins", "BB.Total.Wins", "Tot_Losses", "BB.Total.Losses")][is.na(df[c("Tot_Wins", "BB.Total.Wins", "Tot_Losses", "BB.Total.Losses")])] = 0
+df = df %>% drop_na(Tournament.App)
+
+df = df %>% mutate(Win_Pct = (Tot_Wins + BB.Total.Wins) / (Tot_Wins + BB.Total.Wins + Tot_Losses + BB.Total.Losses))
+df = df %>% mutate(Spend_Pct = Total.Expenses / Total.Academic.Spending..University.Wide.)
+
+df <- df %>%
+  arrange(UNITID, Year) %>%
+  group_by(UNITID) %>%
+  mutate(SAT_change = SAT_AVG - lag(SAT_AVG), ADM_change = ADM_RATE - lag(ADM_RATE), RET_change = RET_FT4 - lag(RET_FT4), Win_change = Win_Pct - lag(Win_Pct), BB_lag = BB.Total.Wins - lag(BB.Total.Wins), FB_lag = Tot_Wins - lag(Tot_Wins))
+df
+```
+
+```{r}
+## Split data to pre and post COVID for train/test data.
+train = df %>% filter(Year < 2020)
+test = df %>% filter(Year > 2020)
+
+## LDA model
+lda_fbs = lda(Tournament.App~log(Total.Expenses), data = train)
+suppressWarnings(predicted <- predict(lda_fbs, test))
+tab = table(predicted$class, test$Tournament.App)
+(tab[1] + tab[4]) / sum(tab)
+tab
+```
+
+```{r}
+## Rearranges data such that a season performance is paired with the following year's admission data.
+effect = df %>% dplyr::select(UNITID, NCAA.Subdivision, FBS.Conference, ADM_RATE, SAT_AVG, RET_FT4, COMP_ORIG_YR4_RT, OVERALL_YR4_N, TRANS_4, Year, SAT_change, ADM_change, RET_change, Win_change, FB_lag, BB_lag) %>%
+  mutate(perf_year = Year - 1)
+effect
+performance = df %>% dplyr::select(UNITID, Year, Tournament.App, Win_Pct, BB.Total.Wins, Tot_Wins, Tot_Losses)
+colnames(performance)[colnames(performance) == 'Year'] = "perf_year"
+
+time_df = merge(effect, performance, by = c("UNITID", "perf_year"))
+time_df = time_df %>% filter((Tot_Wins + Tot_Losses) > 0)
+colnames(time_df)[colnames(time_df) == "Year"] = "School_Year"
+time_df_fbs = time_df %>% filter(NCAA.Subdivision == "Football Bowl Subdivision")
+```
+
+```{r}
+## Plots and linear models that carry out various tests based on
+## 3 different response variables and two different ways to measure wins.
+time_df_fbs %>% ggplot(aes(x = Tot_Wins + BB.Total.Wins, y = ADM_change)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  xlab("Total Football and Basketball Wins") +
+  ylab("Following Year Change in Admission Rate")
+
+time_df_fbs %>% ggplot(aes(x = Tot_Wins + BB.Total.Wins, y = SAT_change)) +
+  geom_point() +
+  geom_smooth(method = "lm")+
+  xlab("Total Football and Basketball Wins") +
+  ylab("Following Year Change in SAT Average")
+
+time_df_fbs %>% ggplot(aes(x = Tot_Wins + BB.Total.Wins, y = RET_change)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  xlab("Total Football and Basketball Wins") +
+  ylab("Following Year Change in Retention Rate")
+
+time_df_fbs %>% ggplot(aes(x = BB_lag + FB_lag, y = ADM_change)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  xlab("Total Football and Basketball Wins") +
+  ylab("Following Year Change in Admission Rate")
+
+time_df_fbs %>% ggplot(aes(x = BB_lag + FB_lag, y = SAT_change)) +
+  geom_point() +
+  geom_smooth(method = "lm")+
+  xlab("Total Football and Basketball Wins") +
+  ylab("Following Year Change in SAT Average")
+
+time_df_fbs %>% ggplot(aes(x = BB_lag + FB_lag, y = RET_change)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  xlab("Total Football and Basketball Wins") +
+  ylab("Following Year Change in Retention Rate")
+
+summary(lm(ADM_change~(BB_lag + FB_lag), data = time_df_fbs))
+summary(lm(SAT_change~(BB_lag + FB_lag), data = time_df_fbs))
+summary(lm(RET_change~(BB_lag + FB_lag), data = time_df_fbs))
+summary(lm(ADM_change~(Tot_Wins + BB.Total.Wins), data = time_df_fbs))
+summary(lm(SAT_change~(Tot_Wins + BB.Total.Wins), data = time_df_fbs))
+summary(lm(RET_change~(Tot_Wins + BB.Total.Wins), data = time_df_fbs))
+```
+
+```{r}
+## Measures and plots spending against total winning percentage as well as a linear model which does the same.
+overall = df %>% group_by(UNITID, NCAA.Subdivision) %>% 
+  summarize(avg_spending = mean(Total.Expenses), 
+                           LT_Win_Pct = (sum(Tot_Wins) + sum(BB.Total.Wins))/(sum(Tot_Wins + BB.Total.Wins + Tot_Losses + BB.Total.Losses)))
+
+
+
+overall %>% ggplot(mapping = aes(x = log(avg_spending), y = LT_Win_Pct, color = NCAA.Subdivision)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "black") +
+  xlab("Log Average College Sports Expenses (2005-2022)") +
+  ylab("Football/Basketball Win Percentage (2005-2022)")
+
+summary(lm(LT_Win_Pct~log(avg_spending), data = overall))
+```
